@@ -1,6 +1,7 @@
 import numpy as np
 import json
 import os
+import sys
 
 def generate_data_files(output_dir="test_data"):
     """Generate data files for testing KNN, KMeans, and ANN"""
@@ -65,24 +66,30 @@ def generate_data_files(output_dir="test_data"):
         with open(os.path.join(output_dir, f"{name}_kmeans.json"), "w") as f:
             json.dump(kmeans_config, f, indent=2)
 
-def run_tests(test_dir="test_data"):
+def generate_test_runner(task_dir="task-1", test_dir="test_data"):
     """Generate a script to run tests with the generated data"""
     
     # Find all test config files
     knn_tests = [f for f in os.listdir(test_dir) if f.endswith("_knn.json")]
     kmeans_tests = [f for f in os.listdir(test_dir) if f.endswith("_kmeans.json")]
     
-    # Generate test runner script
-    with open("run_tests.py", "w") as f:
-        f.write("""import time
+    # Generate test runner script for task-1
+    with open(os.path.join(task_dir, "run_tests.py"), "w") as f:
+        f.write(f"""import sys
+import os
+import time
 import numpy as np
+
+# Add the current directory to the path so we can import the task module
+sys.path.append(os.path.dirname(os.path.abspath(__file__)))
+
 from task import our_knn, our_kmeans, our_ann, compute_recall
 from test import testdata_knn, testdata_kmeans, testdata_ann
 
 def run_knn_test(test_file, metrics=["l2", "cosine", "dot", "manhattan"]):
-    print(f"\\nRunning KNN test with {test_file}")
+    print(f"\\nRunning KNN test with {{test_file}}")
     N, D, A, X, K = testdata_knn(test_file)
-    print(f"Data shape: {N} vectors of dimension {D}, searching for top {K}")
+    print(f"Data shape: {{N}} vectors of dimension {{D}}, searching for top {{K}}")
     
     for metric in metrics:
         # GPU implementation
@@ -114,34 +121,34 @@ def run_knn_test(test_file, metrics=["l2", "cosine", "dot", "manhattan"]):
         
         speedup = cpu_time / gpu_time if gpu_time > 0 else float('inf')
         
-        print(f"  {metric} metric:")
-        print(f"    GPU time: {gpu_time:.6f} sec")
-        print(f"    CPU time: {cpu_time:.6f} sec")
-        print(f"    Speedup: {speedup:.2f}x")
+        print(f"  {{metric}} metric:")
+        print(f"    GPU time: {{gpu_time:.6f}} sec")
+        print(f"    CPU time: {{cpu_time:.6f}} sec")
+        print(f"    Speedup: {{speedup:.2f}}x")
 
 def run_kmeans_test(test_file, metrics=["l2", "cosine"]):
-    print(f"\\nRunning KMeans test with {test_file}")
+    print(f"\\nRunning KMeans test with {{test_file}}")
     N, D, A, K = testdata_kmeans(test_file)
-    print(f"Data shape: {N} vectors of dimension {D}, {K} clusters")
+    print(f"Data shape: {{N}} vectors of dimension {{D}}, {{K}} clusters")
     
     for metric in metrics:
         start = time.time()
         result = our_kmeans(N, D, A, K, metric)
         elapsed = time.time() - start
-        clusters = {}
+        clusters = {{}}
         for i, cluster_id in enumerate(result):
             if cluster_id not in clusters:
                 clusters[cluster_id] = 0
             clusters[cluster_id] += 1
         
-        print(f"  {metric} metric:")
-        print(f"    Time: {elapsed:.6f} sec")
-        print(f"    Cluster distribution: {clusters}")
+        print(f"  {{metric}} metric:")
+        print(f"    Time: {{elapsed:.6f}} sec")
+        print(f"    Cluster distribution: {{clusters}}")
 
 def run_ann_test(test_file, metrics=["l2", "cosine"]):
-    print(f"\\nRunning ANN test with {test_file}")
+    print(f"\\nRunning ANN test with {{test_file}}")
     N, D, A, X, K = testdata_ann(test_file)
-    print(f"Data shape: {N} vectors of dimension {D}, searching for top {K}")
+    print(f"Data shape: {{N}} vectors of dimension {{D}}, searching for top {{K}}")
     
     for metric in metrics:
         # Run exact KNN first
@@ -158,19 +165,29 @@ def run_ann_test(test_file, metrics=["l2", "cosine"]):
         recall = compute_recall(knn_result, ann_result, K)
         speedup = knn_time / ann_time if ann_time > 0 else float('inf')
         
-        print(f"  {metric} metric:")
-        print(f"    KNN time: {knn_time:.6f} sec")
-        print(f"    ANN time: {ann_time:.6f} sec")
-        print(f"    Speedup: {speedup:.2f}x")
-        print(f"    Recall: {recall:.2%}")
+        print(f"  {{metric}} metric:")
+        print(f"    KNN time: {{knn_time:.6f}} sec")
+        print(f"    ANN time: {{ann_time:.6f}} sec")
+        print(f"    Speedup: {{speedup:.2f}}x")
+        print(f"    Recall: {{recall:.2%}}")
 
 if __name__ == "__main__":
+    print("Running tests for task-1...")
+    
+    # First, run the standard test from task.py
+    print("\\n=== Running built-in tests from task.py ===")
+    # This just executes the main function from task.py
+    import task
+    
+    # Then run tests with our generated test data
+    print("\\n=== Running tests with generated data ===")
+    
     # KNN tests
     knn_tests = [
 """)
         
         for test in knn_tests:
-            f.write(f'        "{os.path.join(test_dir, test)}",\n')
+            f.write(f'        "../{test_dir}/{test}",\n')
         
         f.write("""    ]
     
@@ -182,7 +199,7 @@ if __name__ == "__main__":
 """)
         
         for test in kmeans_tests:
-            f.write(f'        "{os.path.join(test_dir, test)}",\n')
+            f.write(f'        "../{test_dir}/{test}",\n')
         
         f.write("""    ]
     
@@ -195,7 +212,13 @@ if __name__ == "__main__":
 """)
 
 if __name__ == "__main__":
+    # Generate test data
     generate_data_files()
-    run_tests()
+    
+    # Generate test runner script
+    generate_test_runner()
+    
     print("Test data and runner script generated successfully.")
-    print("Run 'python run_tests.py' to execute the tests.")
+    print("To run tests:")
+    print("1. First run the built-in tests:   python task-1/task.py")
+    print("2. Then run the generated tests:   python task-1/run_tests.py")

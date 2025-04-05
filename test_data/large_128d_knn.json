@@ -1,7 +1,0 @@
-{
-  "n": 10000,
-  "d": 128,
-  "a_file": "test_data\\large_128d_vectors.txt",
-  "x_file": "test_data\\large_128d_query.txt",
-  "k": 20
-}
