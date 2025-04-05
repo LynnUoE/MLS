@@ -1,0 +1,7 @@
+{
+  "n": 4000,
+  "d": 128,
+  "a_file": "test_data\\medium_128d_vectors.txt",
+  "x_file": "test_data\\medium_128d_query.txt",
+  "k": 10
+}

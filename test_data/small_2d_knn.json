@@ -1,0 +1,7 @@
+{
+  "n": 100,
+  "d": 2,
+  "a_file": "test_data\\small_2d_vectors.txt",
+  "x_file": "test_data\\small_2d_query.txt",
+  "k": 5
+}
