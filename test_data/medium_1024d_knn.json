@@ -1,7 +1,0 @@
-{
-  "n": 4000,
-  "d": 1024,
-  "a_file": "test_data\\medium_1024d_vectors.txt",
-  "x_file": "test_data\\medium_1024d_query.txt",
-  "k": 10
-}

@@ -1,28 +1,27 @@
 import numpy as np
 import json
 import os
-import sys
+import time
 
 def generate_data_files(output_dir="test_data"):
-    """Generate data files for testing KNN, KMeans, and ANN"""
+    """Generate data files for testing KNN, KMeans, and ANN specifically tailored to answer report questions"""
     
     # Create output directory if it doesn't exist
     os.makedirs(output_dir, exist_ok=True)
     
-    # Define test cases with different dimensions and vector counts
+    # Define test cases that address specific report questions
     test_cases = [
-        # Small cases
-        {"n": 100, "d": 2, "k": 5, "name": "small_2d"},
-        {"n": 100, "d": 128, "k": 5, "name": "small_128d"},
-        {"n": 100, "d": 1024, "k": 5, "name": "small_1024d"},
+        # Question 2: Dimension comparison (2 vs 2^15)
+        {"n": 1000, "d": 2, "k": 10, "name": "dim_2"},
+        {"n": 1000, "d": 32768, "k": 10, "name": "dim_2_15"},  # 2^15 = 32768
         
-        # Medium cases
-        {"n": 4000, "d": 2, "k": 10, "name": "medium_2d"},
-        {"n": 4000, "d": 128, "k": 10, "name": "medium_128d"},
-        {"n": 4000, "d": 1024, "k": 10, "name": "medium_1024d"},
+        # Question 5: 4,000 vectors
+        {"n": 4000, "d": 128, "k": 10, "name": "vectors_4k"},
         
-        # Large case (for reference, not for actual testing)
-        {"n": 10000, "d": 128, "k": 20, "name": "large_128d"}
+        # Question 5: 4,000,000 vectors (generate a smaller file for testing,
+        # but with the right configuration for 4M vectors)
+        {"n": 4000000, "d": 128, "k": 10, "name": "vectors_4m_config"},
+        {"n": 10000, "d": 128, "k": 10, "name": "vectors_10k_sample"}  # Sample for actual testing
     ]
     
     for case in test_cases:
@@ -33,18 +32,58 @@ def generate_data_files(output_dir="test_data"):
         
         print(f"Generating data for {name}: {n} vectors of dimension {d}")
         
+        # For very large configurations, we'll create just the JSON config 
+        # but use a smaller sample for actual testing
+        if n > 100000:  # Don't generate full data for very large cases
+            if "config" in name:
+                # Just create the config file, not the actual data
+                config = {
+                    "n": n,
+                    "d": d,
+                    "a_file": f"{output_dir}/{name.replace('_config', '')}_vectors.txt",
+                    "x_file": f"{output_dir}/{name.replace('_config', '')}_query.txt",
+                    "k": k
+                }
+                
+                json_file = os.path.join(output_dir, f"{name}_test.json")
+                with open(json_file, "w") as f:
+                    json.dump(config, f, indent=2)
+                
+                print(f"Created configuration file for large dataset: {json_file}")
+                continue
+        
         # Generate vector collection A
-        A = np.random.randn(n, d).astype(np.float32)
-        a_file = os.path.join(output_dir, f"{name}_vectors.txt")
-        np.savetxt(a_file, A)
+        start_time = time.time()
+        print(f"  Generating {n} vectors...")
+        
+        # For very large dimensions, use a more memory-efficient approach
+        if d > 10000:
+            # Generate and save in chunks to avoid memory issues
+            chunk_size = 100  # Adjust based on your system's memory
+            a_file = os.path.join(output_dir, f"{name}_vectors.txt")
+            
+            with open(a_file, 'w') as f:
+                for i in range(0, n, chunk_size):
+                    end_idx = min(i + chunk_size, n)
+                    chunk_n = end_idx - i
+                    chunk = np.random.randn(chunk_n, d).astype(np.float32)
+                    np.savetxt(f, chunk, fmt='%.6f')
+                    print(f"  Generated vectors {i} to {end_idx-1}")
+        else:
+            # Standard approach for reasonable dimensions
+            A = np.random.randn(n, d).astype(np.float32)
+            a_file = os.path.join(output_dir, f"{name}_vectors.txt")
+            np.savetxt(a_file, A)
         
         # Generate query vector X
         X = np.random.randn(d).astype(np.float32)
         x_file = os.path.join(output_dir, f"{name}_query.txt")
         np.savetxt(x_file, X)
         
-        # Create JSON config file for KNN and ANN
-        knn_config = {
+        print(f"  Data generation took {time.time() - start_time:.2f} seconds")
+        
+        # Create JSON config file
+        config = {
             "n": n,
             "d": d,
             "a_file": a_file,
@@ -52,173 +91,207 @@ def generate_data_files(output_dir="test_data"):
             "k": k
         }
         
-        with open(os.path.join(output_dir, f"{name}_knn.json"), "w") as f:
-            json.dump(knn_config, f, indent=2)
+        json_file = os.path.join(output_dir, f"{name}_test.json")
+        with open(json_file, "w") as f:
+            json.dump(config, f, indent=2)
         
-        # Create JSON config file for KMeans
-        kmeans_config = {
-            "n": n,
-            "d": d,
-            "a_file": a_file,
-            "k": min(k, n // 10)  # K for KMeans is cluster count, keep it reasonable
-        }
-        
-        with open(os.path.join(output_dir, f"{name}_kmeans.json"), "w") as f:
-            json.dump(kmeans_config, f, indent=2)
+        print(f"Created test file: {json_file}")
 
-def generate_test_runner(task_dir="task-1", test_dir="test_data"):
-    """Generate a script to run tests with the generated data"""
+def create_test_script():
+    """Create a test script that specifically addresses the report questions"""
     
-    # Find all test config files
-    knn_tests = [f for f in os.listdir(test_dir) if f.endswith("_knn.json")]
-    kmeans_tests = [f for f in os.listdir(test_dir) if f.endswith("_kmeans.json")]
-    
-    # Generate test runner script for task-1
-    with open(os.path.join(task_dir, "run_tests.py"), "w") as f:
-        f.write(f"""import sys
-import os
+    with open("task1_test_report.py", "w") as f:
+        f.write('''import os
 import time
 import numpy as np
+import torch
+from task1.task import our_knn, our_kmeans, our_ann, compute_recall, compute_distance
+from task1.test import testdata_knn, testdata_kmeans, testdata_ann
 
-# Add the current directory to the path so we can import the task module
-sys.path.append(os.path.dirname(os.path.abspath(__file__)))
-
-from task import our_knn, our_kmeans, our_ann, compute_recall
-from test import testdata_knn, testdata_kmeans, testdata_ann
-
-def run_knn_test(test_file, metrics=["l2", "cosine", "dot", "manhattan"]):
-    print(f"\\nRunning KNN test with {{test_file}}")
-    N, D, A, X, K = testdata_knn(test_file)
-    print(f"Data shape: {{N}} vectors of dimension {{D}}, searching for top {{K}}")
+def test_distance_functions():
+    """
+    Question 1: How did you implement four distinct distance functions on the GPU?
+    Test all distance functions implementation
+    """
+    print("\\n=== Testing Distance Functions ===")
+    # Create some sample data
+    d = 128
+    n = 1000
+    A = np.random.randn(n, d).astype(np.float32)
+    X = np.random.randn(d).astype(np.float32)
     
+    # Move to GPU
+    A_gpu = torch.tensor(A, device="cuda")
+    X_gpu = torch.tensor(X, device="cuda")
+    
+    # Test each distance function
+    metrics = ["l2", "cosine", "dot", "manhattan"]
     for metric in metrics:
-        # GPU implementation
         start = time.time()
-        result = our_knn(N, D, A, X, K, metric)
+        distances = compute_distance(A_gpu, X_gpu, metric=metric)
+        elapsed = time.time() - start
+        
+        print(f"  {metric.upper()} Distance:")
+        print(f"    Time: {elapsed:.6f} seconds")
+        print(f"    First 5 distances: {distances[:5].cpu().numpy()}")
+        print()
+
+def test_dimension_speedup():
+    """
+    Question 2: What is the speed advantage of the GPU over the CPU version 
+    when the dimension is 2? Additionally, what is the speed advantage when 
+    the dimension is 2^15?
+    """
+    print("\\n=== Testing Dimension Speedup ===")
+    
+    # Test for dimension 2
+    test_file = "test_data/dim_2_test.json"
+    if os.path.exists(test_file):
+        N, D, A, X, K = testdata_knn(test_file)
+        
+        print(f"Testing with dimension {D}:")
+        
+        # GPU version
+        start = time.time()
+        result_gpu = our_knn(N, D, A, X, K, "l2")
         gpu_time = time.time() - start
         
-        # CPU implementation (naive)
+        # CPU version
         start = time.time()
         distances = []
-        if metric == "l2":
-            for i in range(N):
-                distances.append(np.sqrt(np.sum((A[i] - X) ** 2)))
-        elif metric == "manhattan":
-            for i in range(N):
-                distances.append(np.sum(np.abs(A[i] - X)))
-        elif metric == "cosine":
-            for i in range(N):
-                dot = np.sum(A[i] * X)
-                norm_a = np.sqrt(np.sum(A[i] ** 2))
-                norm_x = np.sqrt(np.sum(X ** 2))
-                distances.append(1.0 - dot / (norm_a * norm_x))
-        elif metric == "dot":
-            for i in range(N):
-                distances.append(-np.sum(A[i] * X))
-        
-        top_indices = np.argsort(distances)[:K].tolist()
+        for i in range(N):
+            dist = np.sqrt(np.sum((A[i] - X) ** 2))
+            distances.append(dist)
+        sorted_indices = np.argsort(distances)
+        result_cpu = sorted_indices[:K].tolist()
         cpu_time = time.time() - start
         
-        speedup = cpu_time / gpu_time if gpu_time > 0 else float('inf')
-        
-        print(f"  {{metric}} metric:")
-        print(f"    GPU time: {{gpu_time:.6f}} sec")
-        print(f"    CPU time: {{cpu_time:.6f}} sec")
-        print(f"    Speedup: {{speedup:.2f}}x")
-
-def run_kmeans_test(test_file, metrics=["l2", "cosine"]):
-    print(f"\\nRunning KMeans test with {{test_file}}")
-    N, D, A, K = testdata_kmeans(test_file)
-    print(f"Data shape: {{N}} vectors of dimension {{D}}, {{K}} clusters")
+        print(f"  GPU time: {gpu_time:.6f} seconds")
+        print(f"  CPU time: {cpu_time:.6f} seconds")
+        print(f"  Speedup: {cpu_time/gpu_time:.2f}x")
+    else:
+        print(f"Test file {test_file} not found. Skipping dimension 2 test.")
     
-    for metric in metrics:
+    # Test for dimension 2^15
+    test_file = "test_data/dim_2_15_test.json"
+    if os.path.exists(test_file):
+        N, D, A, X, K = testdata_knn(test_file)
+        
+        print(f"\\nTesting with dimension {D}:")
+        
+        # GPU version
         start = time.time()
-        result = our_kmeans(N, D, A, K, metric)
+        result_gpu = our_knn(N, D, A, X, K, "l2")
+        gpu_time = time.time() - start
+        
+        # CPU version - for very high dimensions, just estimate with a small sample
+        sample_size = min(100, N)
+        start = time.time()
+        distances = []
+        for i in range(sample_size):
+            dist = np.sqrt(np.sum((A[i] - X) ** 2))
+            distances.append(dist)
+        cpu_time_sample = time.time() - start
+        
+        # Extrapolate to full dataset
+        cpu_time_estimated = cpu_time_sample * (N / sample_size)
+        
+        print(f"  GPU time: {gpu_time:.6f} seconds")
+        print(f"  Estimated CPU time (based on {sample_size} samples): {cpu_time_estimated:.6f} seconds")
+        print(f"  Estimated speedup: {cpu_time_estimated/gpu_time:.2f}x")
+    else:
+        print(f"Test file {test_file} not found. Skipping dimension 2^15 test.")
+
+def test_top_k_algorithm():
+    """
+    Question 3: Please provide a detailed description of your Top K algorithm.
+    Question 4: What steps did you undertake to implement the Top K on the GPU? 
+    How do you manage data within GPU memory?
+    
+    Test the performance of Top K retrieval
+    """
+    print("\\n=== Testing Top K Algorithm ===")
+    
+    test_file = "test_data/vectors_4k_test.json"
+    if os.path.exists(test_file):
+        N, D, A, X, K = testdata_knn(test_file)
+        
+        print(f"Testing Top K with {N} vectors of dimension {D}, K={K}")
+        
+        # Run KNN with profiling
+        start = time.time()
+        result = our_knn(N, D, A, X, K, "l2")
         elapsed = time.time() - start
-        clusters = {{}}
-        for i, cluster_id in enumerate(result):
-            if cluster_id not in clusters:
-                clusters[cluster_id] = 0
-            clusters[cluster_id] += 1
         
-        print(f"  {{metric}} metric:")
-        print(f"    Time: {{elapsed:.6f}} sec")
-        print(f"    Cluster distribution: {{clusters}}")
+        print(f"  Top K computation completed in {elapsed:.6f} seconds")
+        print(f"  First 5 indices: {result[:5]}")
+    else:
+        print(f"Test file {test_file} not found. Skipping Top K test.")
 
-def run_ann_test(test_file, metrics=["l2", "cosine"]):
-    print(f"\\nRunning ANN test with {{test_file}}")
-    N, D, A, X, K = testdata_ann(test_file)
-    print(f"Data shape: {{N}} vectors of dimension {{D}}, searching for top {{K}}")
+def test_large_vectors():
+    """
+    Question 5: When processing 4,000 vectors, how many seconds does the operation take? 
+    Furthermore, when handling 4,000,000 vectors, what modifications did you implement 
+    to ensure the effective functioning of your code?
+    """
+    print("\\n=== Testing Large Vectors ===")
     
-    for metric in metrics:
-        # Run exact KNN first
-        knn_start = time.time()
-        knn_result = our_knn(N, D, A, X, K, metric)
-        knn_time = time.time() - knn_start
+    # Test with 4,000 vectors
+    test_file = "test_data/vectors_4k_test.json"
+    if os.path.exists(test_file):
+        N, D, A, X, K = testdata_knn(test_file)
         
-        # Run ANN
-        ann_start = time.time()
-        ann_result = our_ann(N, D, A, X, K, metric)
-        ann_time = time.time() - ann_start
+        print(f"Testing with {N} vectors of dimension {D}:")
         
-        # Calculate recall
-        recall = compute_recall(knn_result, ann_result, K)
-        speedup = knn_time / ann_time if ann_time > 0 else float('inf')
+        start = time.time()
+        result = our_knn(N, D, A, X, K, "l2")
+        elapsed = time.time() - start
         
-        print(f"  {{metric}} metric:")
-        print(f"    KNN time: {{knn_time:.6f}} sec")
-        print(f"    ANN time: {{ann_time:.6f}} sec")
-        print(f"    Speedup: {{speedup:.2f}}x")
-        print(f"    Recall: {{recall:.2%}}")
-
-if __name__ == "__main__":
-    print("Running tests for task-1...")
+        print(f"  Operation took {elapsed:.6f} seconds")
+    else:
+        print(f"Test file {test_file} not found. Skipping 4,000 vectors test.")
     
-    # First, run the standard test from task.py
-    print("\\n=== Running built-in tests from task.py ===")
-    # This just executes the main function from task.py
-    import task
-    
-    # Then run tests with our generated test data
-    print("\\n=== Running tests with generated data ===")
-    
-    # KNN tests
-    knn_tests = [
-""")
+    # Test with sample of large dataset to demonstrate scalability
+    test_file = "test_data/vectors_10k_sample_test.json"
+    if os.path.exists(test_file):
+        N, D, A, X, K = testdata_knn(test_file)
         
-        for test in knn_tests:
-            f.write(f'        "../{test_dir}/{test}",\n')
+        print(f"\\nTesting with {N} vectors sample (for 4,000,000 vectors):")
         
-        f.write("""    ]
-    
-    for test in knn_tests:
-        run_knn_test(test)
-    
-    # KMeans tests
-    kmeans_tests = [
-""")
+        start = time.time()
+        result = our_knn(N, D, A, X, K, "l2")
+        elapsed = time.time() - start
         
-        for test in kmeans_tests:
-            f.write(f'        "../{test_dir}/{test}",\n')
+        # Extrapolate performance to 4M vectors
+        extrapolation_factor = 4000000 / N
+        estimated_time = elapsed * extrapolation_factor
         
-        f.write("""    ]
-    
-    for test in kmeans_tests:
-        run_kmeans_test(test)
-    
-    # ANN tests (reuse KNN test files)
-    for test in knn_tests:
-        run_ann_test(test)
-""")
+        print(f"  Sample operation took {elapsed:.6f} seconds")
+        print(f"  Estimated time for 4,000,000 vectors: {estimated_time:.2f} seconds")
+        print("  For 4,000,000 vectors, you would need to implement:")
+        print("    - Batch processing to handle GPU memory constraints")
+        print("    - Parallel processing across multiple GPUs if available")
+        print("    - Optimizing memory usage with mixed precision or quantization")
+    else:
+        print(f"Test file {test_file} not found. Skipping large vectors test.")
 
 if __name__ == "__main__":
-    # Generate test data
+    print("=== Task 1 Report Tests ===")
+    
+    # Run all tests that address the specific report questions
+    test_distance_functions()
+    test_dimension_speedup()
+    test_top_k_algorithm()
+    test_large_vectors()
+    
+    print("\\nAll tests completed.")
+''')
+    
+    print("Created test script: task1_test_report.py")
+
+if __name__ == "__main__":
     generate_data_files()
+    create_test_script()
     
-    # Generate test runner script
-    generate_test_runner()
-    
-    print("Test data and runner script generated successfully.")
-    print("To run tests:")
-    print("1. First run the built-in tests:   python task-1/task.py")
-    print("2. Then run the generated tests:   python task-1/run_tests.py")
+    print("\nTest data generation complete.")
+    print("You can now run the tests with: python task1_test_report.py")
