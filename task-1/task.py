@@ -381,11 +381,11 @@ def our_ann(N, D, A_np, X_np, K, metric="l2"):
     
     # Determine optimal number of clusters based on dataset size
     if N < 1000:
-        num_clusters = max(5, min(20, N // 5))
+        num_clusters = max(5, min(10, N // 10))
     elif N < 10000:
-        num_clusters = max(10, min(50, N // 10))
+        num_clusters = max(10, min(30, N // 20))
     else:
-        num_clusters = max(20, min(100, N // 100))
+        num_clusters = max(20, min(50, N // 100))
     
     # Ensure at least 2 clusters and at most N/4 clusters
     num_clusters = max(2, min(num_clusters, N // 4))
@@ -405,105 +405,88 @@ def our_ann(N, D, A_np, X_np, K, metric="l2"):
     # Find distances to all cluster centroids
     centroid_distances = compute_distance(centroids, X, metric, use_sqrt=use_sqrt)
     
-    # IMPROVEMENT 1: Increase the number of clusters to search to improve recall
+    # IMPROVED: Increase the number of clusters to search to improve recall
     # Use more clusters for better recall, especially for smaller datasets
     if N < 1000:
-        # For small datasets, search almost all clusters
-        search_ratio = 0.8
+        # For small datasets, search more clusters
+        search_ratio = 0.5
     elif N < 10000:
         # For medium datasets, search a significant portion
-        search_ratio = 0.6
+        search_ratio = 0.4
     else:
         # For large datasets, still search a good portion to maintain recall
-        search_ratio = 0.4
+        search_ratio = 0.3
         
     num_clusters_to_search = max(min(int(num_clusters * search_ratio), num_clusters), 3)
+    
+    # Ensure we don't try to search more clusters than we have
+    num_clusters_to_search = min(num_clusters_to_search, num_clusters)
     
     # Sort centroids by distance
     sorted_centroid_indices = torch.argsort(centroid_distances)
     
-    # IMPROVEMENT 2: Use dynamic candidate pool size based on dataset
-    candidates_per_cluster = max(K * 5, 50)
-    min_candidates = min(max(K * 20, 200), N // 2)
+    # IMPROVED: Use dynamic candidate pool size based on dataset
+    candidates_per_cluster = max(K * 2, 20)
+    min_candidates = min(max(K * 10, 100), N // 2)
     
-    # Collect points from top clusters
-    selected_indices_list = []
+    # Collect points from top clusters using a safer approach
+    all_selected_indices = []
     
     # First pass: collect candidates from nearest clusters
-    for i in range(num_clusters_to_search):
+    for i in range(min(num_clusters_to_search, sorted_centroid_indices.size(0))):
         cluster_idx = sorted_centroid_indices[i].item()
         indices = (cluster_ids == cluster_idx).nonzero(as_tuple=True)[0]
         
         if indices.size(0) > 0:
-            # If the cluster has many points, sample based on distance to centroid
+            # If the cluster has many points, sample a subset
             if indices.size(0) > candidates_per_cluster:
-                # Get distances from these points to the query
-                cluster_points = A[indices]
-                point_distances = compute_distance(cluster_points, X, metric, use_sqrt=use_sqrt)
-                
-                # Select closest points from this cluster
-                closest_in_cluster = torch.topk(point_distances, k=min(candidates_per_cluster, indices.size(0)), largest=False).indices
-                indices = indices[closest_in_cluster]
+                perm = torch.randperm(indices.size(0), device="cuda")
+                indices = indices[perm[:candidates_per_cluster]]
             
-            selected_indices_list.append(indices)
+            all_selected_indices.append(indices)
     
-    # IMPROVEMENT 3: If we don't have enough candidates, add more from further clusters
-    if not selected_indices_list or sum(indices.size(0) for indices in selected_indices_list) < min_candidates:
-        remaining_clusters = sorted_centroid_indices[num_clusters_to_search:]
-        additional_clusters_to_check = min(5, remaining_clusters.size(0))
-        
-        for i in range(additional_clusters_to_check):
-            cluster_idx = remaining_clusters[i].item()
-            indices = (cluster_ids == cluster_idx).nonzero(as_tuple=True)[0]
-            
-            if indices.size(0) > 0:
-                if indices.size(0) > candidates_per_cluster:
-                    # Sample random points from this cluster
-                    perm = torch.randperm(indices.size(0), device=indices.device)
-                    indices = indices[perm[:candidates_per_cluster]]
-                
-                selected_indices_list.append(indices)
-                
-                if sum(indices.size(0) for indices in selected_indices_list) >= min_candidates:
-                    break
-    
-    # IMPROVEMENT 4: If still not enough candidates, add random samples
-    total_candidates = sum(indices.size(0) for indices in selected_indices_list) if selected_indices_list else 0
-    
-    if total_candidates < min_candidates:
-        # If we have some indices already, exclude them from random selection
-        if total_candidates > 0:
-            # Concatenate all selected indices
-            existing_indices = torch.cat(selected_indices_list)
-            mask = torch.ones(N, dtype=torch.bool, device="cuda")
-            mask[existing_indices] = False
-            remaining_indices = torch.nonzero(mask).squeeze(1)
-            
-            if remaining_indices.size(0) > 0:
-                # Randomly select from remaining indices
-                num_additional = min(min_candidates - total_candidates, remaining_indices.size(0))
-                perm = torch.randperm(remaining_indices.size(0), device="cuda")
-                random_indices = remaining_indices[perm[:num_additional]]
-                selected_indices_list.append(random_indices)
-        else:
-            # Just select random indices if we have none yet
-            perm = torch.randperm(N, device="cuda")
-            random_indices = perm[:min_candidates]
-            selected_indices_list.append(random_indices)
-    
-    # Concatenate all selected indices and ensure uniqueness
-    if not selected_indices_list:
-        # Fall back to standard KNN if cluster selection fails
+    # If we have no selected indices yet, fall back to regular KNN
+    if not all_selected_indices:
         return our_knn(N, D, A_np, X_np, K, metric)
     
-    selected_indices = torch.cat(selected_indices_list)
+    # Concatenate all selected indices
+    selected_indices = torch.cat(all_selected_indices)
+    
+    # Make sure indices are unique
     selected_indices = torch.unique(selected_indices)
+    
+    # If we have too few candidates, add random samples
+    if selected_indices.size(0) < min_candidates:
+        # Create a mask for indices not yet selected
+        mask = torch.ones(N, dtype=torch.bool, device="cuda")
+        mask.scatter_(0, selected_indices, False)
+        
+        # Get remaining indices safely
+        remaining_indices = torch.nonzero(mask).squeeze(1)
+        
+        if remaining_indices.size(0) > 0:
+            # Determine how many additional indices to select
+            num_additional = min(min_candidates - selected_indices.size(0), remaining_indices.size(0))
+            
+            if num_additional > 0:
+                # Randomly select additional indices
+                perm = torch.randperm(remaining_indices.size(0), device="cuda")
+                additional_indices = remaining_indices[perm[:num_additional]]
+                selected_indices = torch.cat([selected_indices, additional_indices])
+    
+    # Ensure we don't have more indices than total vectors
+    selected_indices = selected_indices[selected_indices < N]
+    
+    # Ensure we have at least K indices
+    if selected_indices.size(0) < K:
+        # Fall back to KNN if we can't get enough candidates
+        return our_knn(N, D, A_np, X_np, K, metric)
     
     # Compute distances for selected points
     selected_points = A[selected_indices]
     distances = compute_distance(selected_points, X, metric, use_sqrt=use_sqrt)
     
-    # Get top K
+    # Get top K from our candidates
     k_to_select = min(K, selected_indices.size(0))
     topk = torch.topk(distances, k=k_to_select, largest=False)
     final_indices = selected_indices[topk.indices]
