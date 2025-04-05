@@ -364,26 +364,31 @@ def our_kmeans(N, D, A_np, K, metric="l2", max_iter=100, tol=1e-4):
         if centroid_change < tol:
             break
     
-    return cluster_ids.cpu().numpy().tolist()
+    return cluster_ids.cpu().numpy().tolist(), centroids
 
 # -----------------------------------------------------------------------------
-# Optimized ANN implementation
+# Improved ANN implementation to address recall issues
 # -----------------------------------------------------------------------------
 def our_ann(N, D, A_np, X_np, K, metric="l2"):
     """
-    Optimized Approximate Nearest Neighbor search using clustering
+    Improved Approximate Nearest Neighbor search using clustering with higher recall
     """
     A = torch.tensor(A_np, dtype=torch.float32, device="cuda")
     X = torch.tensor(X_np, dtype=torch.float32, device="cuda")
     
-    # Determine optimal number of clusters based on dataset size
-    if N < 10000:
-        num_clusters = min(10, N // 10)
-    else:
-        num_clusters = min(100, N // 1000)
+    # Determine if we should use sqrt for L2 distance
+    use_sqrt = (metric == "l2" and D <= 16)
     
-    # Ensure at least 2 clusters and at most N/2 clusters
-    num_clusters = max(2, min(num_clusters, N // 2))
+    # Determine optimal number of clusters based on dataset size
+    if N < 1000:
+        num_clusters = max(5, min(20, N // 5))
+    elif N < 10000:
+        num_clusters = max(10, min(50, N // 10))
+    else:
+        num_clusters = max(20, min(100, N // 100))
+    
+    # Ensure at least 2 clusters and at most N/4 clusters
+    num_clusters = max(2, min(num_clusters, N // 4))
     
     # Use cached clusters if possible for repeated queries
     if hasattr(our_ann, 'cached_clusters') and our_ann.cached_clusters[0].shape[0] == N:
@@ -391,63 +396,112 @@ def our_ann(N, D, A_np, X_np, K, metric="l2"):
         centroids = our_ann.cached_clusters[1]
     else:
         # Run KMeans
-        cluster_ids_list = our_kmeans(N, D, A_np, num_clusters, metric=metric)
+        cluster_ids_list, centroids = our_kmeans(N, D, A_np, num_clusters, metric=metric)
         cluster_ids = torch.tensor(cluster_ids_list, device="cuda")
-        
-        # Compute centroids
-        centroids = []
-        for j in range(num_clusters):
-            points = A[cluster_ids == j]
-            if points.size(0) > 0:
-                centroids.append(points.mean(dim=0))
-            else:
-                centroids.append(torch.zeros(D, device="cuda"))
-        centroids = torch.stack(centroids)
         
         # Cache the clusters for future use
         our_ann.cached_clusters = (cluster_ids, centroids)
     
-    # Find closest clusters to query
-    centroid_distances = compute_distance(centroids, X, metric)
+    # Find distances to all cluster centroids
+    centroid_distances = compute_distance(centroids, X, metric, use_sqrt=use_sqrt)
     
-    # Determine number of clusters to search based on dataset size
-    num_clusters_to_search = min(max(3, num_clusters // 3), num_clusters)
-    top_cluster_indices = torch.topk(centroid_distances, k=num_clusters_to_search, largest=False).indices
+    # IMPROVEMENT 1: Increase the number of clusters to search to improve recall
+    # Use more clusters for better recall, especially for smaller datasets
+    if N < 1000:
+        # For small datasets, search almost all clusters
+        search_ratio = 0.8
+    elif N < 10000:
+        # For medium datasets, search a significant portion
+        search_ratio = 0.6
+    else:
+        # For large datasets, still search a good portion to maintain recall
+        search_ratio = 0.4
+        
+    num_clusters_to_search = max(min(int(num_clusters * search_ratio), num_clusters), 3)
+    
+    # Sort centroids by distance
+    sorted_centroid_indices = torch.argsort(centroid_distances)
+    
+    # IMPROVEMENT 2: Use dynamic candidate pool size based on dataset
+    candidates_per_cluster = max(K * 5, 50)
+    min_candidates = min(max(K * 20, 200), N // 2)
     
     # Collect points from top clusters
     selected_indices_list = []
-    for c in top_cluster_indices:
-        indices = (cluster_ids == c.item()).nonzero(as_tuple=True)[0]
-        if len(selected_indices_list) == 0 or selected_indices_list[-1].device != indices.device:
-            selected_indices_list = [indices]
-        else:
+    
+    # First pass: collect candidates from nearest clusters
+    for i in range(num_clusters_to_search):
+        cluster_idx = sorted_centroid_indices[i].item()
+        indices = (cluster_ids == cluster_idx).nonzero(as_tuple=True)[0]
+        
+        if indices.size(0) > 0:
+            # If the cluster has many points, sample based on distance to centroid
+            if indices.size(0) > candidates_per_cluster:
+                # Get distances from these points to the query
+                cluster_points = A[indices]
+                point_distances = compute_distance(cluster_points, X, metric, use_sqrt=use_sqrt)
+                
+                # Select closest points from this cluster
+                closest_in_cluster = torch.topk(point_distances, k=min(candidates_per_cluster, indices.size(0)), largest=False).indices
+                indices = indices[closest_in_cluster]
+            
             selected_indices_list.append(indices)
     
-    # Handle the case where selected_indices_list might be empty
+    # IMPROVEMENT 3: If we don't have enough candidates, add more from further clusters
+    if not selected_indices_list or sum(indices.size(0) for indices in selected_indices_list) < min_candidates:
+        remaining_clusters = sorted_centroid_indices[num_clusters_to_search:]
+        additional_clusters_to_check = min(5, remaining_clusters.size(0))
+        
+        for i in range(additional_clusters_to_check):
+            cluster_idx = remaining_clusters[i].item()
+            indices = (cluster_ids == cluster_idx).nonzero(as_tuple=True)[0]
+            
+            if indices.size(0) > 0:
+                if indices.size(0) > candidates_per_cluster:
+                    # Sample random points from this cluster
+                    perm = torch.randperm(indices.size(0), device=indices.device)
+                    indices = indices[perm[:candidates_per_cluster]]
+                
+                selected_indices_list.append(indices)
+                
+                if sum(indices.size(0) for indices in selected_indices_list) >= min_candidates:
+                    break
+    
+    # IMPROVEMENT 4: If still not enough candidates, add random samples
+    total_candidates = sum(indices.size(0) for indices in selected_indices_list) if selected_indices_list else 0
+    
+    if total_candidates < min_candidates:
+        # If we have some indices already, exclude them from random selection
+        if total_candidates > 0:
+            # Concatenate all selected indices
+            existing_indices = torch.cat(selected_indices_list)
+            mask = torch.ones(N, dtype=torch.bool, device="cuda")
+            mask[existing_indices] = False
+            remaining_indices = torch.nonzero(mask).squeeze(1)
+            
+            if remaining_indices.size(0) > 0:
+                # Randomly select from remaining indices
+                num_additional = min(min_candidates - total_candidates, remaining_indices.size(0))
+                perm = torch.randperm(remaining_indices.size(0), device="cuda")
+                random_indices = remaining_indices[perm[:num_additional]]
+                selected_indices_list.append(random_indices)
+        else:
+            # Just select random indices if we have none yet
+            perm = torch.randperm(N, device="cuda")
+            random_indices = perm[:min_candidates]
+            selected_indices_list.append(random_indices)
+    
+    # Concatenate all selected indices and ensure uniqueness
     if not selected_indices_list:
         # Fall back to standard KNN if cluster selection fails
         return our_knn(N, D, A_np, X_np, K, metric)
     
-    # Concatenate all selected indices and ensure uniqueness
     selected_indices = torch.cat(selected_indices_list)
     selected_indices = torch.unique(selected_indices)
     
-    # If we have too few candidates, add more from random clusters
-    min_candidates = min(max(K * 10, 100), N)
-    if selected_indices.size(0) < min_candidates:
-        remaining_indices = torch.ones(N, dtype=torch.bool, device="cuda")
-        remaining_indices[selected_indices] = False
-        remaining = remaining_indices.nonzero(as_tuple=True)[0]
-        
-        if remaining.size(0) > 0:
-            # Randomly select additional indices
-            perm = torch.randperm(remaining.size(0), device="cuda")
-            additional = remaining[perm[:min_candidates-selected_indices.size(0)]]
-            selected_indices = torch.cat([selected_indices, additional])
-    
     # Compute distances for selected points
     selected_points = A[selected_indices]
-    distances = compute_distance(selected_points, X, metric)
+    distances = compute_distance(selected_points, X, metric, use_sqrt=use_sqrt)
     
     # Get top K
     k_to_select = min(K, selected_indices.size(0))
@@ -486,7 +540,7 @@ def test_kmeans():
     prewarm_gpu()
     N, D, A, K = testdata_kmeans("")
     start = time.time()
-    result = our_kmeans(N, D, A, K)
+    result, _ = our_kmeans(N, D, A, K)
     elapsed = time.time() - start
     print(f"KMeans result: First 10 cluster IDs: {result[:10]}\nElapsed: {elapsed:.4f} sec")
 
@@ -631,6 +685,49 @@ def test_dimension_scaling():
         elif D >= 32768:
             print(f"  Note: For D={D}, using optimized large-dimension path")
 
+def test_dimension_details():
+    """Test specific dimension ranges that showed issues in previous runs"""
+    prewarm_gpu()
+    
+    problematic_dims = [2, 16, 64, 128, 512, 1024, 4096]
+    N = 1000
+    K = 10
+    
+    print("\nDetailed testing for problematic dimensions:")
+    print("Dimension\tGPU Time (s)\tCPU Time (s)\tSpeedup")
+    
+    for D in problematic_dims:
+        # Generate random data
+        A_np = np.random.randn(N, D).astype(np.float32)
+        X_np = np.random.randn(D).astype(np.float32)
+        
+        # GPU timing with careful warmup
+        A = torch.tensor(A_np, device="cuda")
+        X = torch.tensor(X_np, device="cuda")
+        
+        # Specific warmup for this dimension
+        for _ in range(3):  # Multiple warmup runs
+            _ = compute_distance(A[:50], X, "l2")
+            torch.cuda.synchronize()
+        
+        # Actual timing
+        torch.cuda.synchronize()
+        start = time.time()
+        distances = compute_distance(A, X, "l2")
+        topk = torch.topk(distances, k=K, largest=False)
+        torch.cuda.synchronize()
+        gpu_time = time.time() - start
+        
+        # CPU timing
+        start = time.time()
+        distances = []
+        for i in range(N):
+            distances.append(np.sqrt(np.sum((A_np[i] - X_np) ** 2)))
+        cpu_time = time.time() - start
+        
+        speedup = cpu_time / gpu_time if gpu_time > 0 else float('inf')
+        print(f"{D}\t\t{gpu_time:.6f}\t{cpu_time:.6f}\t{speedup:.2f}x")
+
 def test_vector_count_scaling():
     """Test how performance scales with vector count"""
     prewarm_gpu()
@@ -732,49 +829,6 @@ def extrapolate_large_dataset():
     print("3. Mixed precision (FP16) to reduce memory usage and increase throughput")
     print("4. Quantization techniques to compress vectors")
     print("5. Progressive refinement approach (coarse search followed by fine search)")
-
-def test_dimension_details():
-    """Test specific dimension ranges that showed issues in previous runs"""
-    prewarm_gpu()
-    
-    problematic_dims = [2, 16, 64, 128, 512, 1024, 4096]
-    N = 1000
-    K = 10
-    
-    print("\nDetailed testing for problematic dimensions:")
-    print("Dimension\tGPU Time (s)\tCPU Time (s)\tSpeedup")
-    
-    for D in problematic_dims:
-        # Generate random data
-        A_np = np.random.randn(N, D).astype(np.float32)
-        X_np = np.random.randn(D).astype(np.float32)
-        
-        # GPU timing with careful warmup
-        A = torch.tensor(A_np, device="cuda")
-        X = torch.tensor(X_np, device="cuda")
-        
-        # Specific warmup for this dimension
-        for _ in range(3):  # Multiple warmup runs
-            _ = compute_distance(A[:50], X, "l2")
-            torch.cuda.synchronize()
-        
-        # Actual timing
-        torch.cuda.synchronize()
-        start = time.time()
-        distances = compute_distance(A, X, "l2")
-        topk = torch.topk(distances, k=K, largest=False)
-        torch.cuda.synchronize()
-        gpu_time = time.time() - start
-        
-        # CPU timing
-        start = time.time()
-        distances = []
-        for i in range(N):
-            distances.append(np.sqrt(np.sum((A_np[i] - X_np) ** 2)))
-        cpu_time = time.time() - start
-        
-        speedup = cpu_time / gpu_time if gpu_time > 0 else float('inf')
-        print(f"{D}\t\t{gpu_time:.6f}\t{cpu_time:.6f}\t{speedup:.2f}x")
 
 if __name__ == "__main__":
     print("\n--- Basic Tests (with GPU prewarming) ---")
