@@ -372,39 +372,26 @@ def our_kmeans(N, D, A_np, K, metric="l2", max_iter=100, tol=1e-4):
 def our_ann(N, D, A_np, X_np, K, metric="l2"):
     """
     Optimized Approximate Nearest Neighbor search using clustering
-    
-    Parameters:
-    - N: Number of vectors
-    - D: Dimension of vectors
-    - A_np: A collection of vectors (N, D)
-    - X_np: Query vector (D)
-    - K: Number of top results to return
-    - metric: Distance metric to use
-    
-    Returns:
-    - List of indices of top K nearest vectors
     """
     A = torch.tensor(A_np, dtype=torch.float32, device="cuda")
     X = torch.tensor(X_np, dtype=torch.float32, device="cuda")
     
     # Determine optimal number of clusters based on dataset size
-    if N < 1000:
-        num_clusters = min(20, N // 5)
-    elif N < 10000:
-        num_clusters = min(50, N // 10)
+    if N < 10000:
+        num_clusters = min(30, N // 10)  # Increased from 10 to 30
     else:
-        num_clusters = min(200, N // 200)
+        num_clusters = min(200, N // 1000)  # Increased from 100 to 200
     
-    # Ensure at least 5 clusters and at most N/3 clusters
-    num_clusters = max(5, min(num_clusters, N // 3))
+    # Ensure at least 3 clusters and at most N/3 clusters
+    num_clusters = max(3, min(num_clusters, N // 3))
     
     # Use cached clusters if possible for repeated queries
     if hasattr(our_ann, 'cached_clusters') and our_ann.cached_clusters[0].shape[0] == N:
         cluster_ids = our_ann.cached_clusters[0]
         centroids = our_ann.cached_clusters[1]
     else:
-        # Run KMeans with more iterations for better clustering
-        cluster_ids_list = our_kmeans(N, D, A_np, num_clusters, metric=metric, max_iter=150, tol=1e-5)
+        # Run KMeans with slightly more iterations for better clustering
+        cluster_ids_list = our_kmeans(N, D, A_np, num_clusters, metric=metric, max_iter=120)
         cluster_ids = torch.tensor(cluster_ids_list, device="cuda")
         
         # Compute centroids
@@ -423,48 +410,48 @@ def our_ann(N, D, A_np, X_np, K, metric="l2"):
     # Find closest clusters to query
     centroid_distances = compute_distance(centroids, X, metric)
     
-    # K1: Number of clusters to search (INCREASED)
-    K1 = min(max(num_clusters * 2 // 3, 5), num_clusters)  # Search at least 2/3 of the clusters
+    # K1: Number of clusters to search - INCREASED from 1/3 to 1/2 of clusters
+    # This is the first key parameter to improve recall
+    K1 = min(max(num_clusters // 2, 5), num_clusters)  # Search at least half of the clusters
     top_cluster_indices = torch.topk(centroid_distances, k=K1, largest=False).indices
     
-    # K2: Number of points to consider from each cluster (NEW PARAMETER)
-    K2 = min(max(K * 5, 50), N // K1)  # Consider more points from each cluster
-    
-    # Collect points from top clusters with their distances
-    all_candidate_indices = []
-    all_candidate_distances = []
-    
+    # Collect points from top clusters
+    selected_indices = []
     for c in top_cluster_indices:
         cluster_idx = c.item()
-        # Get points in this cluster
+        # Get indices of points in this cluster
         indices = (cluster_ids == cluster_idx).nonzero(as_tuple=True)[0]
         
-        if indices.size(0) > 0:
-            # Get data points for this cluster
-            cluster_points = A[indices]
-            
-            # Compute distances within this cluster
-            cluster_distances = compute_distance(cluster_points, X, metric)
-            
-            # Get top K2 points from this cluster (or all if less than K2)
-            k_to_select = min(K2, indices.size(0))
-            topk_cluster = torch.topk(cluster_distances, k=k_to_select, largest=False)
-            
-            all_candidate_indices.append(indices[topk_cluster.indices])
-            all_candidate_distances.append(topk_cluster.values)
+        if len(selected_indices) == 0:
+            selected_indices = [indices]
+        else:
+            selected_indices.append(indices)
     
-    # Concatenate results from all clusters
-    if not all_candidate_indices:
-        # Fall back to standard KNN if no candidate indices
+    # Handle the case where selected_indices_list might be empty
+    if not selected_indices:
+        # Fall back to standard KNN if cluster selection fails
         return our_knn(N, D, A_np, X_np, K, metric)
     
-    candidate_indices = torch.cat(all_candidate_indices)
-    candidate_distances = torch.cat(all_candidate_distances)
+    # Concatenate all selected indices
+    all_indices = torch.cat(selected_indices)
     
-    # Get top K from all candidates
-    k_to_select = min(K, candidate_indices.size(0))
-    final_topk = torch.topk(candidate_distances, k=k_to_select, largest=False)
-    final_indices = candidate_indices[final_topk.indices]
+    # K2: Limit points per cluster based on dataset size - NEW PARAMETER
+    # This is the second key parameter to improve recall
+    max_candidates = min(max(K * 20, 200), N)  # Consider more points for final selection
+    
+    if all_indices.size(0) > max_candidates:
+        # Randomly sample if we have too many points (better than just taking first K)
+        perm = torch.randperm(all_indices.size(0), device="cuda")
+        all_indices = all_indices[perm[:max_candidates]]
+    
+    # Compute distances for selected points
+    selected_points = A[all_indices]
+    distances = compute_distance(selected_points, X, metric)
+    
+    # Get top K
+    k_to_select = min(K, all_indices.size(0))
+    topk = torch.topk(distances, k=k_to_select, largest=False)
+    final_indices = all_indices[topk.indices]
     
     return final_indices.cpu().numpy().tolist()
 
