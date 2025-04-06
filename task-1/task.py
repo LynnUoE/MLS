@@ -210,13 +210,24 @@ def compute_distance_batched(A, X, metric="l2", block_size=None, batch_size=5000
     return output
 
 # -----------------------------------------------------------------------------
-# Optimized Top-K KNN with metric option and batch processing
+# Optimized KNN Implementation
 # -----------------------------------------------------------------------------
 def our_knn(N, D, A_np, X_np, K, metric="l2", cache_tensors=False):
     """
-    Optimized KNN implementation with dimension-specific tuning
+    Optimized KNN implementation based on the pseudocode in the vector search PDF
+    
+    Algorithm 1: kNN (brute force)
+    Input: a set D of n vectors, a query vector q, distance function dist(·, ·), k
+    Output: S_k ⊆ D such that |S_k| = k, dist(q, x) ≥ dist(q, y) for any x ∈ S_k, y ∈ D \ S_k
+    1: S_k ← ∅
+    2: for each x ∈ D do
+    3:   compute dist(q, x)
+    4: end for
+    5: sort vectors x of D according to dist(q, x) in non-decreasing order
+    6: S_k ← top-k x's in the sorted order
+    7: return S_k
     """
-    # Check if data is already on GPU
+    # Convert data to GPU tensors if not already
     if cache_tensors and hasattr(our_knn, 'cached_tensors'):
         cached_A, cached_X, cached_metric = our_knn.cached_tensors
         if cached_A.shape == (N, D) and cached_X.shape[-1] == D and cached_metric == metric:
@@ -232,86 +243,139 @@ def our_knn(N, D, A_np, X_np, K, metric="l2", cache_tensors=False):
         if cache_tensors:
             our_knn.cached_tensors = (A, X, metric)
     
-    # Determine if we should use sqrt for L2 distance (only needed for small D)
-    use_sqrt = (metric == "l2" and D <= 16)
-    
     # Use batched processing for large datasets
-    if N > 50000:
-        distances = compute_distance_batched(A, X, metric, use_sqrt=use_sqrt)
-    else:
-        distances = compute_distance(A, X, metric, use_sqrt=use_sqrt)
+    batch_size = 50000
     
-    topk = torch.topk(distances, k=min(K, N), largest=False)
+    # Compute distances efficiently based on the distance metric
+    if N > batch_size:
+        distances = torch.empty(N, device="cuda")
+        for i in range(0, N, batch_size):
+            end_idx = min(i + batch_size, N)
+            batch = A[i:end_idx]
+            
+            if metric == "l2":
+                # L2 distance (squared)
+                dist_batch = torch.sum((batch - X.unsqueeze(0)) ** 2, dim=1)
+            elif metric == "cosine":
+                # Cosine distance: 1 - cos(angle)
+                X_norm = torch.norm(X)
+                batch_norm = torch.norm(batch, dim=1, keepdim=True)
+                dot_prod = torch.matmul(batch, X)
+                # Avoid division by zero
+                safe_norms = torch.clamp(batch_norm * X_norm, min=1e-8)
+                dist_batch = 1.0 - dot_prod / safe_norms.squeeze()
+            elif metric == "dot":
+                # Negative dot product (since smaller is closer)
+                dist_batch = -torch.matmul(batch, X)
+            elif metric == "manhattan":
+                # L1 distance
+                dist_batch = torch.sum(torch.abs(batch - X.unsqueeze(0)), dim=1)
+            else:
+                raise ValueError(f"Unsupported metric: {metric}")
+                
+            distances[i:end_idx] = dist_batch
+    else:
+        if metric == "l2":
+            distances = torch.sum((A - X.unsqueeze(0)) ** 2, dim=1)
+        elif metric == "cosine":
+            X_norm = torch.norm(X)
+            A_norm = torch.norm(A, dim=1, keepdim=True)
+            dot_prod = torch.matmul(A, X)
+            # Avoid division by zero
+            safe_norms = torch.clamp(A_norm * X_norm, min=1e-8)
+            distances = 1.0 - dot_prod / safe_norms.squeeze()
+        elif metric == "dot":
+            distances = -torch.matmul(A, X)
+        elif metric == "manhattan":
+            distances = torch.sum(torch.abs(A - X.unsqueeze(0)), dim=1)
+        else:
+            raise ValueError(f"Unsupported metric: {metric}")
+    
+    # Find top-K nearest neighbors (smallest distances)
+    k_actual = min(K, N)  # Ensure K is not larger than N
+    topk = torch.topk(distances, k=k_actual, largest=False)
+    
+    # Return the indices of the top-K nearest neighbors
     return topk.indices.cpu().numpy().tolist()
 
 # -----------------------------------------------------------------------------
-# Optimized KMeans implementation
+# Optimized KMeans Implementation
 # -----------------------------------------------------------------------------
 def kmeans_plus_plus(A, K, metric="l2"):
     """
-    A: tensor with shape (N, D) on GPU.
-    Returns K initial centroids using K-means++ algorithm.
+    Optimized K-means++ initialization
+    
+    1. Choose the first centroid uniformly at random from the data points
+    2. For each data point, compute the distance to the nearest existing centroid
+    3. Choose the next centroid with probability proportional to the squared distance
+    4. Repeat until K centroids are chosen
     """
     N = A.shape[0]
     D = A.shape[1]
     centroids = []
     
-    # Randomly select the first centroid and squeeze to 1D vector.
+    # Randomly select the first centroid
     first_idx = torch.randint(0, N, (1,), device=A.device)
     centroids.append(A[first_idx].squeeze(0))
     
-    # Use squared distances for L2 to avoid sqrt operations
-    use_sqrt = False
-    
     for _ in range(1, K):
-        if N > 50000:
-            # Batched implementation for large datasets
-            dists = compute_distance_batched(A, centroids[0].unsqueeze(0), metric, use_sqrt=use_sqrt)
-            for c in centroids[1:]:
-                d_new = compute_distance_batched(A, c.unsqueeze(0), metric, use_sqrt=use_sqrt)
-                dists = torch.minimum(dists, d_new)
-        else:
-            dists = compute_distance(A, centroids[0].unsqueeze(0), metric, use_sqrt=use_sqrt)
-            for c in centroids[1:]:
-                d_new = compute_distance(A, c.unsqueeze(0), metric, use_sqrt=use_sqrt)
-                dists = torch.minimum(dists, d_new)
+        # Calculate minimum distance to any existing centroid
+        dists = torch.full((N,), float('inf'), device=A.device)
         
-        # Square distances for probability distribution
-        if metric != "l2" or use_sqrt:
-            dists = dists ** 2
-            
-        # Avoid division by zero
-        total = dists.sum()
-        if total < 1e-10:
-            # If all distances are very small, choose randomly
+        for c in centroids:
+            if metric == "l2":
+                # Squared Euclidean distance
+                new_dists = torch.sum((A - c.unsqueeze(0)) ** 2, dim=1)
+            elif metric == "cosine":
+                # Cosine distance
+                c_norm = torch.norm(c)
+                A_norm = torch.norm(A, dim=1)
+                cos_sim = torch.matmul(A, c) / (A_norm * c_norm + 1e-8)
+                new_dists = 1.0 - cos_sim
+            else:
+                # Default to L2 for other metrics
+                new_dists = torch.sum((A - c.unsqueeze(0)) ** 2, dim=1)
+                
+            dists = torch.minimum(dists, new_dists)
+        
+        # Square the distances to give more weight to points far from centroids
+        weights = dists ** 2
+        
+        # If all distances are very small, choose randomly
+        if torch.sum(weights) < 1e-8:
             next_idx = torch.randint(0, N, (1,), device=A.device)
         else:
-            probs = dists / total
-            cumulative_probs = torch.cumsum(probs, dim=0)
-            r = torch.rand(1, device=A.device)
-            next_idx = torch.searchsorted(cumulative_probs, r)
-            # Ensure index is in bounds
-            if next_idx >= N:
-                next_idx = torch.tensor([N-1], device=A.device)
-        
+            # Sample next centroid with probability proportional to squared distance
+            weights = weights / torch.sum(weights)
+            next_idx = torch.multinomial(weights, 1)
+            
         centroids.append(A[next_idx].squeeze(0))
     
     return torch.stack(centroids)
 
 def our_kmeans(N, D, A_np, K, metric="l2", max_iter=100, tol=1e-4):
     """
-    Optimized K-means clustering with dimension-specific tuning
+    Optimized K-means clustering implementation based on Lloyd's algorithm
+    
+    Algorithm: Lloyd's K-means algorithm
+    Input: D = {x_1, . . . , x_n}, K;
+    Output: clustering C = {C_1, . . . , C_K} of D
+    
+    1. initialize C_1, …, C_K;
+    2. while not converged do
+    3.   compute centroid μ_i = (1/|C_i|) ∑_{x∈C_i} x for each i = 1, . . . , K;
+    4.   update C_1, …, C_K by assigning each x ∈ D to cluster C_ℓ whose centroid μ_ℓ it is closest to;
+    5.   if C_1, …, C_K don't change, we have converged;
+    6. return clustering C_1, …, C_K
     """
+    # Convert data to GPU tensor
     A = torch.tensor(A_np, dtype=torch.float32, device="cuda")
     
     # Initialize centroids with K-means++
     centroids = kmeans_plus_plus(A, K, metric)
     
-    # Determine batch size based on dataset size and available memory
-    batch_size = min(50000, N)
-    
-    # Determine if we should use sqrt for L2 distance (not needed for clustering)
-    use_sqrt = False
+    # Determine batch size based on dataset size
+    batch_size = min(10000, N)
     
     # Previous cluster assignments
     prev_cluster_ids = torch.zeros(N, dtype=torch.long, device="cuda") - 1
@@ -325,14 +389,24 @@ def our_kmeans(N, D, A_np, K, metric="l2", max_iter=100, tol=1e-4):
             batch = A[batch_start:batch_end]
             
             # Calculate distances to each centroid
-            batch_dists = torch.zeros((batch_end - batch_start, K), device="cuda")
+            distances = torch.zeros((batch_end - batch_start, K), device="cuda")
+            
             for j in range(K):
-                centroid = centroids[j].unsqueeze(0)
-                d = compute_distance(batch, centroid, metric, use_sqrt=use_sqrt)
-                batch_dists[:, j] = d
+                if metric == "l2":
+                    # Squared Euclidean distance
+                    distances[:, j] = torch.sum((batch - centroids[j].unsqueeze(0)) ** 2, dim=1)
+                elif metric == "cosine":
+                    # Cosine distance
+                    centroid_norm = torch.norm(centroids[j])
+                    batch_norm = torch.norm(batch, dim=1)
+                    cos_sim = torch.matmul(batch, centroids[j]) / (batch_norm * centroid_norm + 1e-8)
+                    distances[:, j] = 1.0 - cos_sim
+                else:
+                    # Default to L2 for other metrics
+                    distances[:, j] = torch.sum((batch - centroids[j].unsqueeze(0)) ** 2, dim=1)
             
             # Assign to nearest centroid
-            batch_cluster_ids = torch.argmin(batch_dists, dim=1)
+            batch_cluster_ids = torch.argmin(distances, dim=1)
             cluster_ids[batch_start:batch_end] = batch_cluster_ids
         
         # Check for convergence based on cluster assignments
@@ -367,31 +441,37 @@ def our_kmeans(N, D, A_np, K, metric="l2", max_iter=100, tol=1e-4):
     return cluster_ids.cpu().numpy().tolist()
 
 # -----------------------------------------------------------------------------
-# Optimized ANN implementation
+# Optimized ANN Implementation
 # -----------------------------------------------------------------------------
 def our_ann(N, D, A_np, X_np, K, metric="l2"):
     """
-    Optimized Approximate Nearest Neighbor search using clustering
+    Optimized Approximate Nearest Neighbor algorithm
+    
+    Pseudocode from PDF:
+    1. Use KMeans to cluster the data into K clusters
+    2. In each query, find the nearest K1 cluster center as the approximate nearest neighbor
+    3. Use KNN to find the nearest K2 neighbor from the K1 cluster centers
+    4. Merge K1 * K2 vectors and find top K neighbors
     """
     A = torch.tensor(A_np, dtype=torch.float32, device="cuda")
     X = torch.tensor(X_np, dtype=torch.float32, device="cuda")
     
     # Determine optimal number of clusters based on dataset size
-    if N < 10000:
-        num_clusters = min(30, N // 10)  # Increased from 10 to 30
+    if N < 5000:
+        num_clusters = min(50, N // 10)
     else:
-        num_clusters = min(200, N // 1000)  # Increased from 100 to 200
+        num_clusters = min(200, N // 100)
     
-    # Ensure at least 3 clusters and at most N/3 clusters
-    num_clusters = max(3, min(num_clusters, N // 3))
+    # Ensure reasonable number of clusters
+    num_clusters = max(10, min(num_clusters, N // 5))
     
     # Use cached clusters if possible for repeated queries
     if hasattr(our_ann, 'cached_clusters') and our_ann.cached_clusters[0].shape[0] == N:
         cluster_ids = our_ann.cached_clusters[0]
         centroids = our_ann.cached_clusters[1]
     else:
-        # Run KMeans with slightly more iterations for better clustering
-        cluster_ids_list = our_kmeans(N, D, A_np, num_clusters, metric=metric, max_iter=120)
+        # Run KMeans
+        cluster_ids_list = our_kmeans(N, D, A_np, num_clusters, metric=metric, max_iter=100)
         cluster_ids = torch.tensor(cluster_ids_list, device="cuda")
         
         # Compute centroids
@@ -407,51 +487,74 @@ def our_ann(N, D, A_np, X_np, K, metric="l2"):
         # Cache the clusters for future use
         our_ann.cached_clusters = (cluster_ids, centroids)
     
-    # Find closest clusters to query
-    centroid_distances = compute_distance(centroids, X, metric)
+    # Find closest clusters to query using the appropriate distance metric
+    if metric == "l2":
+        centroid_distances = torch.sum((centroids - X.unsqueeze(0)) ** 2, dim=1)
+    elif metric == "cosine":
+        X_norm = torch.norm(X)
+        centroid_norms = torch.norm(centroids, dim=1)
+        cos_sim = torch.matmul(centroids, X) / (centroid_norms * X_norm + 1e-8)
+        centroid_distances = 1.0 - cos_sim
+    elif metric == "dot":
+        centroid_distances = -torch.matmul(centroids, X)
+    elif metric == "manhattan":
+        centroid_distances = torch.sum(torch.abs(centroids - X.unsqueeze(0)), dim=1)
     
-    # K1: Number of clusters to search - INCREASED from 1/3 to 1/2 of clusters
-    # This is the first key parameter to improve recall
-    K1 = min(max(num_clusters // 2, 5), num_clusters)  # Search at least half of the clusters
+    # K1: Number of clusters to search
+    # Adaptive K1 based on dataset size and number of clusters
+    K1 = min(max(num_clusters // 2, 5), num_clusters)
     top_cluster_indices = torch.topk(centroid_distances, k=K1, largest=False).indices
     
-    # Collect points from top clusters
-    selected_indices = []
-    for c in top_cluster_indices:
-        cluster_idx = c.item()
-        # Get indices of points in this cluster
-        indices = (cluster_ids == cluster_idx).nonzero(as_tuple=True)[0]
-        
-        if len(selected_indices) == 0:
-            selected_indices = [indices]
-        else:
-            selected_indices.append(indices)
+    # K2: Number of points to retrieve from each cluster
+    # Adaptive K2 based on dataset size and K
+    K2 = min(max(K * 5, 100), N // (K1 * 2))
     
-    # Handle the case where selected_indices_list might be empty
-    if not selected_indices:
-        # Fall back to standard KNN if cluster selection fails
+    # Collect points from top clusters with distances
+    all_candidate_indices = []
+    all_candidate_distances = []
+    
+    for cluster_idx in top_cluster_indices:
+        # Get indices of points in this cluster
+        cluster_point_indices = torch.nonzero(cluster_ids == cluster_idx.item(), as_tuple=True)[0]
+        
+        if cluster_point_indices.size(0) > 0:
+            # Get points from this cluster
+            cluster_points = A[cluster_point_indices]
+            
+            # Calculate distances to query
+            if metric == "l2":
+                distances = torch.sum((cluster_points - X.unsqueeze(0)) ** 2, dim=1)
+            elif metric == "cosine":
+                X_norm = torch.norm(X)
+                point_norms = torch.norm(cluster_points, dim=1)
+                cos_sim = torch.matmul(cluster_points, X) / (point_norms * X_norm + 1e-8)
+                distances = 1.0 - cos_sim
+            elif metric == "dot":
+                distances = -torch.matmul(cluster_points, X)
+            elif metric == "manhattan":
+                distances = torch.sum(torch.abs(cluster_points - X.unsqueeze(0)), dim=1)
+            
+            # Get top K2 nearest points from this cluster
+            k_to_select = min(K2, cluster_point_indices.size(0))
+            if k_to_select > 0:
+                topk = torch.topk(distances, k=k_to_select, largest=False)
+                
+                # Store indices and distances
+                all_candidate_indices.append(cluster_point_indices[topk.indices])
+                all_candidate_distances.append(topk.values)
+    
+    # Handle case where no candidates were found
+    if not all_candidate_indices:
         return our_knn(N, D, A_np, X_np, K, metric)
     
-    # Concatenate all selected indices
-    all_indices = torch.cat(selected_indices)
+    # Combine all candidate points
+    candidate_indices = torch.cat(all_candidate_indices)
+    candidate_distances = torch.cat(all_candidate_distances)
     
-    # K2: Limit points per cluster based on dataset size - NEW PARAMETER
-    # This is the second key parameter to improve recall
-    max_candidates = min(max(K * 20, 200), N)  # Consider more points for final selection
-    
-    if all_indices.size(0) > max_candidates:
-        # Randomly sample if we have too many points (better than just taking first K)
-        perm = torch.randperm(all_indices.size(0), device="cuda")
-        all_indices = all_indices[perm[:max_candidates]]
-    
-    # Compute distances for selected points
-    selected_points = A[all_indices]
-    distances = compute_distance(selected_points, X, metric)
-    
-    # Get top K
-    k_to_select = min(K, all_indices.size(0))
-    topk = torch.topk(distances, k=k_to_select, largest=False)
-    final_indices = all_indices[topk.indices]
+    # Get final top K
+    k_to_select = min(K, candidate_indices.size(0))
+    final_topk = torch.topk(candidate_distances, k=k_to_select, largest=False)
+    final_indices = candidate_indices[final_topk.indices]
     
     return final_indices.cpu().numpy().tolist()
 
