@@ -34,8 +34,8 @@ def testdata_kmeans(test_file):
 def testdata_knn(test_file):
     if test_file == "":
         # use random data
-        N = 1000
-        D = 100
+        N = 10000
+        D = 1000
         A = np.random.randn(N, D)
         X = np.random.randn(D)
         K = 10
