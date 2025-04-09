@@ -968,6 +968,7 @@ def main():
     # Make sure output directories exist
     os.makedirs("results", exist_ok=True)
     os.makedirs("figures", exist_ok=True)
+
     
     # Record system info
     device = torch.cuda.get_device_name(0) if torch.cuda.is_available() else "CPU only"
@@ -977,23 +978,27 @@ def main():
     print("=" * 80)
     
     # Run experiments
+    gpu_prewarm()
     print("\n1. Distance Functions Scaling Test")
     print("-" * 80)
     test_distance_functions_scaling()
     
+    gpu_prewarm()
     print("\n2. KMeans Vector Count Test")
     print("-" * 80)
     test_kmeans_vector_count()
     
+    gpu_prewarm()
     print("\n3. KMeans Dimension Test")
     print("-" * 80)
     test_kmeans_dimension()
     
-    
+    gpu_prewarm()
     print("\n4. KNN Vector Count Test")
     print("-" * 80)
     test_knn_vector_count()
     
+    gpu_prewarm()
     print("\n5. KNN Dimension Test")
     print("-" * 80)
     test_knn_dimension()
@@ -1002,7 +1007,6 @@ def main():
     print("Results are saved in the 'results/' directory, and figures in the 'figures/' directory.")
     
     # Generate summary report
-    # generate_summary_report()
 
 def generate_summary_report():
     """Generate a comprehensive summary report of all experiments."""
@@ -1141,6 +1145,19 @@ def generate_summary_report():
     for metric in ['l2', 'cosine', 'dot', 'manhattan']:
         best_experiment = summary_df.loc[summary_df[f'max_{metric}_speedup'].idxmax()]
         print(f"- Best {metric.capitalize()} speedup: {best_experiment[f'max_{metric}_speedup']:.2f}x in {best_experiment['experiment']}")
+
+# -----------------------------------------------------------------------------
+# GPU Pre-warming Function
+# -----------------------------------------------------------------------------
+def gpu_prewarm():
+    """Pre-warm the GPU by executing a dummy matrix multiplication."""
+    if torch.cuda.is_available():
+        print("Pre-warming GPU...")
+        dummy_a = torch.randn(1024, 1024, device="cuda")
+        dummy_b = torch.randn(1024, 1024, device="cuda")
+        _ = torch.mm(dummy_a, dummy_b)
+        torch.cuda.synchronize()
+        print("GPU warming complete.")
 
 if __name__ == "__main__":
     main()

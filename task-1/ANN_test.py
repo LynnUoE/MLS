@@ -68,6 +68,11 @@ def compute_params(N, D, K, metric):
         expected_points_per_cluster = N / n_clusters
         K2 = min(max(base_K2, K * 3), int(expected_points_per_cluster * 0.8))
         n_probe = min(max(int(n_clusters * 0.35), 3), n_clusters)
+    elif metric == 'manhattan':
+        n_clusters = int(n_clusters * 1.2)
+        expected_points_per_cluster = N / n_clusters
+        K2 = min(max(base_K2, K), int(expected_points_per_cluster * 0.9))
+        n_probe = min(max(int(n_clusters * 0.35), 5), n_clusters)
     else:  # L2 or Manhattan
         K2 = min(max(base_K2, K * 2), int(expected_points_per_cluster * 0.7))
         n_probe = min(max(int(n_clusters * 0.3), 3), n_clusters)
@@ -138,7 +143,7 @@ def offline_kmeans(metric, A_np, n_clusters, D, N):
     elif metric == 'dot':
         cpu_cluster_ids, cpu_centroids = our_kmeans_dot(N, D, A_np, n_clusters)
     elif metric == 'manhattan':
-        cpu_cluster_ids, cpu_centroids = our_kmeans_manhattan(N, D, A_np, n_clusters)
+        cpu_cluster_ids, cpu_centroids = our_kmeans_l2(N, D, A_np, n_clusters)
     else:
         raise ValueError(f"Unknown distance metric: {metric}")
     
@@ -692,6 +697,9 @@ def main():
     
     # Number of queries to average for more reliable results
     num_queries = 10
+
+    # Pre-warm the GPU to compile kernels and initialize CUDA contexts
+    gpu_prewarm()
     
     print("\n===== GPU Vector Search ANN Evaluation =====")
     print(f"Testing with {num_queries} queries per configuration")
@@ -818,6 +826,20 @@ def main():
           f"Cosine recall: {high_dim_cosine_recall:.1f}%")
     
     print("\nTest completed successfully. All metrics evaluated across all dimensions.")
+
+
+# -----------------------------------------------------------------------------
+# GPU Pre-warming Function
+# -----------------------------------------------------------------------------
+def gpu_prewarm():
+    """Pre-warm the GPU by executing a dummy matrix multiplication."""
+    if torch.cuda.is_available():
+        print("Pre-warming GPU...")
+        dummy_a = torch.randn(1024, 1024, device="cuda")
+        dummy_b = torch.randn(1024, 1024, device="cuda")
+        _ = torch.mm(dummy_a, dummy_b)
+        torch.cuda.synchronize()
+        print("GPU warming complete.")
 
 if __name__ == "__main__":
     main()
