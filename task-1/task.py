@@ -63,13 +63,18 @@ def cosine_distance_kernel(A, X, output, D: tl.constexpr, stride_A: tl.constexpr
 def l2_distance_kernel(A, X, output, D: tl.constexpr, stride_A: tl.constexpr, BLOCK_SIZE: tl.constexpr):
     pid = tl.program_id(0)
     row_ptr = A + pid * stride_A
+    
+    # Accumulate squared differences in smaller chunks for better register usage
     acc = 0.0
     for d in range(0, D, BLOCK_SIZE):
         offs = d + tl.arange(0, BLOCK_SIZE)
-        a = tl.load(row_ptr + offs, mask=offs < D, other=0.0)
-        x = tl.load(X + offs, mask=offs < D, other=0.0)
+        mask = offs < D
+        a = tl.load(row_ptr + offs, mask=mask, other=0.0)
+        x = tl.load(X + offs, mask=mask, other=0.0)
         diff = a - x
-        acc += tl.sum(diff * diff)
+        acc += tl.sum(diff * diff, axis=0)
+    
+    # Take square root only once at the end
     tl.store(output + pid, tl.sqrt(acc))
 
 @triton.jit
@@ -107,14 +112,29 @@ def gpu_topk(distances, k):
 # -----------------------------------------------------------------------------
 # Helper functions for GPU distance computations using Triton kernels
 # -----------------------------------------------------------------------------
-def gpu_l2_distance(A, x, D, block_size=None):
+def gpu_l2_distance(A, x, D, batch_size=500000, block_size=None):
+    """Process L2 distance computation in batches to avoid memory issues."""
     if block_size is None:
         block_size = 256 if D > 512 else 128
+    
     N = A.shape[0]
     distances = torch.empty((N,), device=A.device, dtype=torch.float32)
-    grid = (N,)
-    l2_distance_kernel[grid](A, x.unsqueeze(0), distances, D, A.stride(0), BLOCK_SIZE=block_size)
-    torch.cuda.synchronize()
+    
+    # Process in batches
+    for i in range(0, N, batch_size):
+        end_idx = min(i + batch_size, N)
+        batch_size_actual = end_idx - i
+        
+        grid = (batch_size_actual,)
+        l2_distance_kernel[grid](
+            A[i:end_idx], x, 
+            distances[i:end_idx], 
+            D, A.stride(0), 
+            BLOCK_SIZE=block_size
+        )
+        # Synchronize after each batch to ensure completion
+        torch.cuda.synchronize()
+    
     return distances
 
 def gpu_cosine_distance(A, x, D, block_size=None):
@@ -504,12 +524,32 @@ def our_ann_manhattan(N, D, A_np, X_np, K):
 # KNN implementations using fixed GPU TopK
 # -----------------------------------------------------------------------------
 def our_knn_l2(N, D, A_np, X_np, K):
+    # Detect large datasets and use appropriate strategy
+    large_dataset = N > 1000000
+    
+    # Convert to GPU tensors
     A = torch.tensor(A_np, dtype=torch.float32, device="cuda")
     X = torch.tensor(X_np, dtype=torch.float32, device="cuda")
-    distances = torch.empty((N,), device=A.device, dtype=torch.float32)
-    grid = (N,)
-    block_size = 256 if D > 512 else 128
-    l2_distance_kernel[grid](A, X, distances, D, A.stride(0), BLOCK_SIZE=block_size)
+    
+    # Use batched processing for large datasets
+    if large_dataset:
+        # Calculate appropriate batch size based on D
+        if D <= 128:
+            batch_size = 500000
+        elif D <= 512:
+            batch_size = 250000
+        else:
+            batch_size = 100000
+            
+        distances = gpu_l2_distance(A, X, D, batch_size=batch_size)
+    else:
+        # For smaller datasets, use standard approach
+        distances = torch.empty((N,), device=A.device, dtype=torch.float32)
+        grid = (N,)
+        block_size = 256 if D > 512 else 128
+        l2_distance_kernel[grid](A, X, distances, D, A.stride(0), BLOCK_SIZE=block_size)
+    
+    # Use optimized topk implementation
     topk_indices = gpu_topk(distances, K)
     return topk_indices.cpu().numpy().tolist()
 

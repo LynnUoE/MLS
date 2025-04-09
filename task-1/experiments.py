@@ -989,6 +989,7 @@ def main():
     print("-" * 80)
     test_kmeans_dimension()
     
+    
     print("\n4. KNN Vector Count Test")
     print("-" * 80)
     test_knn_vector_count()
